@@ -6,6 +6,9 @@ import { Client } from "@microsoft/microsoft-graph-client";
 import { cachePlugin } from "../msal-cache.js";
 import { type AccountData, getAccount, listAccounts, setActiveAccount } from "./account-manager.js";
 import { parseJwt, refreshAccountTokenSilent } from "./browser-auth.js";
+import { setupDnsLookupFallback } from "../utils/dns-patch.js";
+
+setupDnsLookupFallback();
 
 const CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
 const AUTHORITY = "https://login.microsoftonline.com/common";
