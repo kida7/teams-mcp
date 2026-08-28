@@ -17,11 +17,7 @@ export function setupDnsLookupFallback(): void {
   }
 
   // @ts-expect-error - overriding dns.lookup
-  dns.lookup = (
-    hostname: string,
-    options: any,
-    callback?: any
-  ) => {
+  dns.lookup = (hostname: string, options: any, callback?: any) => {
     let cb: any;
     let opts: any = {};
 
@@ -38,11 +34,15 @@ export function setupDnsLookupFallback(): void {
 
     origLookup(hostname, opts, (err: any, address: any, family: any) => {
       if (err && (err.code === "EBUSY" || err.code === "ENOTFOUND")) {
-        dns.promises.resolve4(hostname)
+        dns.promises
+          .resolve4(hostname)
           .then((ips) => {
             if (ips && ips.length > 0) {
-              if (opts && opts.all) {
-                cb(null, ips.map((ip) => ({ address: ip, family: 4 })));
+              if (opts?.all) {
+                cb(
+                  null,
+                  ips.map((ip) => ({ address: ip, family: 4 }))
+                );
               } else {
                 cb(null, ips[0], 4);
               }

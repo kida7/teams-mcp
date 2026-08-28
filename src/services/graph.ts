@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { type AccountInfo, PublicClientApplication } from "@azure/msal-node";
 import { Client } from "@microsoft/microsoft-graph-client";
 import { cachePlugin } from "../msal-cache.js";
+import { setupDnsLookupFallback } from "../utils/dns-patch.js";
 import { type AccountData, getAccount, listAccounts, setActiveAccount } from "./account-manager.js";
 import { parseJwt, refreshAccountTokenSilent } from "./browser-auth.js";
-import { setupDnsLookupFallback } from "../utils/dns-patch.js";
 
 setupDnsLookupFallback();
 
@@ -119,7 +119,9 @@ export class GraphService {
           this.isInitialized = true;
           return;
         }
-        console.warn("AUTH_TOKEN in environment is expired or invalid. Falling back to account store.");
+        console.warn(
+          "AUTH_TOKEN in environment is expired or invalid. Falling back to account store."
+        );
       }
 
       // Priority 2: Multi-Account Store (~/.teams-mcp/accounts.json)
