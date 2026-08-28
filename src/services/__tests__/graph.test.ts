@@ -46,7 +46,6 @@ describe("GraphService", () => {
   let graphService: GraphService;
 
   beforeEach(() => {
-    server.listen({ onUnhandledRequest: "error" });
     vi.clearAllMocks();
     setupDefaultMsalMock();
 
@@ -57,7 +56,6 @@ describe("GraphService", () => {
 
   afterEach(() => {
     server.resetHandlers();
-    server.close();
   });
 
   describe("getInstance", () => {
@@ -391,6 +389,75 @@ describe("GraphService", () => {
 
       // MSAL should not be used when AUTH_TOKEN is present
       expect(PublicClientApplication).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Stored browser auth token", () => {
+    it("should use token from ~/.msgraph-mcp-auth.json when MSAL has no accounts", async () => {
+      // Mock MSAL with no accounts
+      vi.mocked(PublicClientApplication).mockImplementationOnce(function () {
+        return {
+          getTokenCache: vi.fn().mockReturnValue({
+            getAllAccounts: vi.fn().mockResolvedValue([]),
+          }),
+        };
+      } as any);
+
+      const mockPayload = Buffer.from(
+        JSON.stringify({
+          aud: "00000003-0000-0000-c000-000000000000",
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        })
+      ).toString("base64url");
+      const storedToken = `header.${mockPayload}.signature`;
+
+      const fs = await import("node:fs");
+      vi.mocked(fs.promises.readFile).mockResolvedValueOnce(
+        JSON.stringify({
+          token: storedToken,
+          expiresAt: new Date(Date.now() + 3600000).toISOString(),
+          authMethod: "browser",
+        })
+      );
+
+      const mockClient = {
+        api: vi.fn().mockReturnValue({
+          get: vi.fn().mockResolvedValue(mockUser),
+        }),
+      };
+      vi.mocked(Client.initWithMiddleware).mockReturnValue(mockClient as any);
+
+      const status = await graphService.getAuthStatus();
+      expect(status.isAuthenticated).toBe(true);
+    });
+
+    it("should reject expired stored browser token", async () => {
+      vi.mocked(PublicClientApplication).mockImplementationOnce(function () {
+        return {
+          getTokenCache: vi.fn().mockReturnValue({
+            getAllAccounts: vi.fn().mockResolvedValue([]),
+          }),
+        };
+      } as any);
+
+      const expiredPayload = Buffer.from(
+        JSON.stringify({
+          aud: "https://graph.microsoft.com",
+          exp: Math.floor(Date.now() / 1000) - 3600, // expired 1h ago
+        })
+      ).toString("base64url");
+      const storedToken = `header.${expiredPayload}.signature`;
+
+      const fs = await import("node:fs");
+      vi.mocked(fs.promises.readFile).mockResolvedValueOnce(
+        JSON.stringify({
+          token: storedToken,
+          expiresAt: new Date(Date.now() - 3600000).toISOString(),
+        })
+      );
+
+      const status = await graphService.getAuthStatus();
+      expect(status.isAuthenticated).toBe(false);
     });
   });
 

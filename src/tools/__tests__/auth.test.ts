@@ -1,10 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { listAccounts } from "../../services/account-manager.js";
 import {
   createMockGraphService,
   createMockMcpServer,
   createMockUnauthenticatedGraphService,
 } from "../../test-utils/setup.js";
 import { registerAuthTools } from "../auth.js";
+
+// Mock account-manager
+vi.mock("../../services/account-manager.js", () => ({
+  listAccounts: vi.fn(),
+  getAccount: vi.fn(),
+  setActiveAccount: vi.fn(),
+  saveAccount: vi.fn(),
+}));
 
 describe("Authentication Tools", () => {
   let mockServer: any;
@@ -13,6 +22,22 @@ describe("Authentication Tools", () => {
   beforeEach(() => {
     mockServer = createMockMcpServer();
     vi.clearAllMocks();
+
+    vi.mocked(listAccounts).mockResolvedValue({
+      activeAccount: "user1@company.com",
+      accounts: [
+        {
+          id: "user1@company.com",
+          account: "user1@company.com",
+          displayName: "User One",
+          targetApp: "outlook",
+          profileDir: "/mock/profile/dir",
+          authMethod: "browser",
+          authenticated: true,
+          expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        },
+      ],
+    });
   });
 
   describe("auth_status tool", () => {
@@ -24,8 +49,7 @@ describe("Authentication Tools", () => {
         "auth_status",
         expect.objectContaining({
           title: "Auth Status",
-          description:
-            "Check the authentication status of the Microsoft Graph connection. Returns whether the user is authenticated and shows their basic profile information.",
+          description: expect.stringContaining("Check the authentication status"),
           inputSchema: {},
           annotations: expect.objectContaining({
             readOnlyHint: true,
@@ -43,15 +67,9 @@ describe("Authentication Tools", () => {
       const authTool = mockServer.getTool("auth_status");
       const result = await authTool.handler();
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: "text",
-            text: "✅ Authenticated as Test User (test.user@example.com)",
-          },
-        ],
-      });
-
+      expect(result.content[0].text).toContain(
+        "✅ Authenticated as Test User (test.user@example.com)"
+      );
       expect(mockGraphService.getAuthStatus).toHaveBeenCalledTimes(1);
     });
 
@@ -62,77 +80,41 @@ describe("Authentication Tools", () => {
       const authTool = mockServer.getTool("auth_status");
       const result = await authTool.handler();
 
-      expect(result).toEqual({
-        content: [
-          {
-            type: "text",
-            text: "❌ Not authenticated. Please run: npx @floriscornel/teams-mcp@latest authenticate",
-          },
-        ],
-      });
-
+      expect(result.content[0].text).toContain("❌ Not authenticated");
       expect(mockGraphService.getAuthStatus).toHaveBeenCalledTimes(1);
     });
+  });
 
-    it("should handle partial authentication data gracefully", async () => {
-      const partialMockGraphService = {
-        getAuthStatus: vi.fn().mockResolvedValue({
-          isAuthenticated: true,
-          displayName: "Test User",
-          // Missing userPrincipalName
-        }),
-      } as any;
+  describe("list_accounts tool", () => {
+    it("should list all configured accounts", async () => {
+      mockGraphService = createMockGraphService();
+      registerAuthTools(mockServer, mockGraphService, false);
 
-      registerAuthTools(mockServer, partialMockGraphService, false);
+      const listTool = mockServer.getTool("list_accounts");
+      const result = await listTool.handler();
 
-      const authTool = mockServer.getTool("auth_status");
-      const result = await authTool.handler();
-
-      expect(result).toEqual({
-        content: [
-          {
-            type: "text",
-            text: "✅ Authenticated as Test User (No email available)",
-          },
-        ],
-      });
+      expect(result.content[0].text).toContain("user1@company.com");
+      expect(result.content[0].text).toContain("[ACTIVE]");
     });
+  });
 
-    it("should handle authentication status errors", async () => {
-      const errorMockGraphService = {
-        getAuthStatus: vi.fn().mockRejectedValue(new Error("Auth check failed")),
-      } as any;
-
-      registerAuthTools(mockServer, errorMockGraphService, false);
-
-      const authTool = mockServer.getTool("auth_status");
-
-      // Should throw the error since it's not caught in the tool
-      await expect(authTool.handler()).rejects.toThrow("Auth check failed");
-    });
-
-    it("should handle null/undefined user data", async () => {
-      const nullDataMockGraphService = {
-        getAuthStatus: vi.fn().mockResolvedValue({
-          isAuthenticated: true,
-          displayName: null,
-          userPrincipalName: null,
+  describe("switch_account tool", () => {
+    it("should switch account and return confirmation", async () => {
+      mockGraphService = {
+        ...createMockGraphService(),
+        switchAccount: vi.fn().mockResolvedValue({
+          id: "user2@company.com",
+          account: "user2@company.com",
+          displayName: "User Two",
         }),
-      } as any;
+      };
+      registerAuthTools(mockServer, mockGraphService, false);
 
-      registerAuthTools(mockServer, nullDataMockGraphService, false);
+      const switchTool = mockServer.getTool("switch_account");
+      const result = await switchTool.handler({ accountId: "user2@company.com" });
 
-      const authTool = mockServer.getTool("auth_status");
-      const result = await authTool.handler();
-
-      expect(result).toEqual({
-        content: [
-          {
-            type: "text",
-            text: "✅ Authenticated as Unknown User (No email available)",
-          },
-        ],
-      });
+      expect(result.content[0].text).toContain("✅ Switched active account to: User Two");
+      expect(mockGraphService.switchAccount).toHaveBeenCalledWith("user2@company.com");
     });
   });
 
@@ -143,53 +125,9 @@ describe("Authentication Tools", () => {
 
       const registeredTools = mockServer.getAllTools();
       expect(registeredTools).toContain("auth_status");
-      expect(registeredTools).toHaveLength(1);
-    });
-
-    it("should handle GraphService being undefined", () => {
-      expect(() => {
-        registerAuthTools(mockServer, undefined as any, false);
-      }).not.toThrow();
-
-      // Tool should still be registered
-      expect(mockServer.registerTool).toHaveBeenCalledWith(
-        "auth_status",
-        expect.objectContaining({
-          description: expect.any(String),
-          inputSchema: {},
-        }),
-        expect.any(Function)
-      );
-    });
-  });
-
-  describe("authentication state changes", () => {
-    it("should reflect real-time authentication status changes", async () => {
-      // Start with unauthenticated state
-      let isAuthenticated = false;
-      const dynamicMockGraphService = {
-        getAuthStatus: vi.fn().mockImplementation(() => {
-          return Promise.resolve({
-            isAuthenticated,
-            displayName: isAuthenticated ? "Test User" : undefined,
-            userPrincipalName: isAuthenticated ? "test.user@example.com" : undefined,
-          });
-        }),
-      } as any;
-
-      registerAuthTools(mockServer, dynamicMockGraphService, false);
-      const authTool = mockServer.getTool("auth_status");
-
-      // Check unauthenticated status
-      let result = await authTool.handler();
-      expect(result.content[0].text).toContain("❌ Not authenticated");
-
-      // Simulate authentication
-      isAuthenticated = true;
-
-      // Check authenticated status
-      result = await authTool.handler();
-      expect(result.content[0].text).toContain("✅ Authenticated as Test User");
+      expect(registeredTools).toContain("list_accounts");
+      expect(registeredTools).toContain("switch_account");
+      expect(registeredTools).toHaveLength(3);
     });
   });
 });

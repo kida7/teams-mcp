@@ -1,5 +1,5 @@
 {
-  "name": "@floriscornel/teams-mcp",
+  "name": "@kida7/teams-mcp",
   "version": "1.0.0",
   "description": "MCP server for Microsoft Graph Teams integration",
   "type": "module",
@@ -17,13 +17,19 @@
   },
   "scripts": {
     "build": "npm run clean && npm run compile",
-    "clean": "rm -rf dist",
+    "clean": "node -e \"fs.rmSync('dist', {recursive: true, force: true})\"",
     "compile": "tsc",
     "ci": "biome ci src/",
     "dev": "tsx watch src/index.ts",
     "auth": "node dist/index.js authenticate",
+    "auth:browser": "node dist/index.js authenticate --browser",
+    "auth:outlook": "node dist/index.js authenticate --browser --app outlook",
+    "auth:teams": "node dist/index.js authenticate --browser --app teams",
+    "auth:accounts": "node dist/index.js accounts",
     "auth:check": "node dist/index.js check",
+    "auth:switch": "node dist/index.js use",
     "auth:logout": "node dist/index.js logout",
+    "auth:logout:all": "node dist/index.js logout --all",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -41,19 +47,20 @@
     "teams",
     "model-context-protocol"
   ],
-  "author": "Floris Cornel",
+  "author": "kida7",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/floriscornel/teams-mcp.git"
+    "url": "git+https://github.com/kida7/teams-mcp.git"
   },
-  "homepage": "https://github.com/floriscornel/teams-mcp#readme",
+  "homepage": "https://github.com/kida7/teams-mcp#readme",
   "bugs": {
-    "url": "https://github.com/floriscornel/teams-mcp/issues"
+    "url": "https://github.com/kida7/teams-mcp/issues"
   },
   "dependencies": {
     "@azure/identity": "^4.13.1",
     "@azure/identity-cache-persistence": "^1.2.0",
+    "@azure/msal-node": "^5.6.0",
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "@microsoft/microsoft-graph-types": "^2.43.1",
     "@modelcontextprotocol/sdk": "^1.28.0",
@@ -63,6 +70,7 @@
     "dompurify": "^3.3.3",
     "jsdom": "^29.0.1",
     "marked": "^17.0.5",
+    "playwright": "^1.62.1",
     "turndown": "^7.2.2",
     "turndown-plugin-gfm": "^1.0.2",
     "zod": "^4.3.6"
