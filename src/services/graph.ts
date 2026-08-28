@@ -114,8 +114,9 @@ export class GraphService {
             },
           });
           this.isInitialized = true;
+          return;
         }
-        return;
+        console.warn("AUTH_TOKEN in environment is expired or invalid. Falling back to account store.");
       }
 
       // Priority 2: Multi-Account Store (~/.teams-mcp/accounts.json)
