@@ -211,6 +211,12 @@ export async function saveAccount(account: AccountData, makeActive = true): Prom
   await saveAccountsStore(store);
 }
 
+/** Get the active account ID */
+export async function getActiveAccountId(): Promise<string | undefined> {
+  const store = await getAccountsStore();
+  return store.activeAccount;
+}
+
 /** Set the active account */
 export async function setActiveAccount(accountIdOrAlias: string): Promise<AccountData> {
   const store = await getAccountsStore();

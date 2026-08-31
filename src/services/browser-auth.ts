@@ -1,3 +1,4 @@
+import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { stdin as input, stdout as output } from "node:process";
@@ -6,6 +7,7 @@ import { type BrowserContext, chromium } from "playwright";
 import {
   type AccountData,
   getAccount,
+  getActiveAccountId,
   getProfileDirForAccount,
   saveAccount,
 } from "./account-manager.js";
@@ -166,9 +168,11 @@ export async function authenticateViaBrowser(
   const appDisplayName = targetApp === "teams" ? "Microsoft Teams Web" : "Outlook Web";
   const timeoutMs = options.timeoutMs ?? 300_000; // 5 minutes
 
-  // Determine initial profile directory
-  const temporaryProfileId = options.accountId || `temp_${Date.now()}`;
-  const profileDir = getProfileDirForAccount(temporaryProfileId);
+  // Determine initial profile directory: prioritize existing active account's profile if available
+  const existingAccount = await getAccount(options.accountId);
+  const activeAccountId = options.accountId || existingAccount?.id || (await getActiveAccountId());
+  const initialProfileId = activeAccountId || `temp_${Date.now()}`;
+  const profileDir = getProfileDirForAccount(initialProfileId);
 
   console.log("\n🌐 Microsoft Graph Browser Authentication");
   console.log("=".repeat(50));
@@ -276,6 +280,16 @@ export async function authenticateViaBrowser(
 
     const accountId = options.accountId || accountName;
     const finalProfileDir = getProfileDirForAccount(accountId);
+
+    // If a temporary profile was used and differs from finalProfileDir, copy over
+    if (profileDir !== finalProfileDir) {
+      try {
+        await fs.cp(profileDir, finalProfileDir, { recursive: true, force: true });
+        await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+      } catch {
+        // Best-effort profile sync
+      }
+    }
 
     const accountData: AccountData = {
       id: accountId,
