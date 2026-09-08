@@ -2,7 +2,13 @@ import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type AccountInfo, PublicClientApplication } from "@azure/msal-node";
-import { Client } from "@microsoft/microsoft-graph-client";
+import {
+  type AuthenticationProvider,
+  Client,
+  type Context,
+  type Middleware,
+  MiddlewareFactory,
+} from "@microsoft/microsoft-graph-client";
 import { cachePlugin } from "../msal-cache.js";
 import { setupDnsLookupFallback } from "../utils/dns-patch.js";
 import { type AccountData, getAccount, listAccounts, setActiveAccount } from "./account-manager.js";
@@ -40,12 +46,57 @@ export interface AuthStatus {
   displayName?: string | undefined;
   expiresAt?: string | undefined;
   accountId?: string | undefined;
-  targetApp?: string | undefined;
-  authMethod?: string | undefined;
+  targetApp?: "outlook" | "teams" | undefined;
+  authMethod?: "browser" | "device_code" | "token" | undefined;
   autoRefresh?: boolean | undefined;
   availableAccounts?:
     | Array<{ id: string; account: string; displayName?: string | undefined }>
     | undefined;
+}
+
+class AutoRefreshMiddleware implements Middleware {
+  private nextMiddleware: Middleware | undefined;
+  private accountId: string;
+  private onTokenRefreshed: ((newToken: string) => void) | undefined = undefined;
+  private isRefreshing = false;
+
+  constructor(accountId: string, onTokenRefreshed?: (newToken: string) => void) {
+    this.accountId = accountId;
+    this.onTokenRefreshed = onTokenRefreshed;
+  }
+
+  setNext(next: Middleware): void {
+    this.nextMiddleware = next;
+  }
+
+  async execute(context: Context): Promise<void> {
+    if (!this.nextMiddleware) return;
+    await this.nextMiddleware.execute(context);
+
+    if (context.response && context.response.status === 401 && !this.isRefreshing) {
+      this.isRefreshing = true;
+      try {
+        const authHeader = context.response.headers.get("www-authenticate") || "";
+        let claims: string | undefined;
+        const claimsMatch = authHeader.match(/claims="([^"]+)"/i);
+        if (claimsMatch) {
+          try {
+            claims = Buffer.from(claimsMatch[1], "base64").toString("utf8");
+          } catch {
+            claims = claimsMatch[1];
+          }
+        }
+
+        const refreshed = await refreshAccountTokenSilent(this.accountId, 45_000, claims);
+        if (refreshed) {
+          this.onTokenRefreshed?.(refreshed);
+          await this.nextMiddleware.execute(context);
+        }
+      } finally {
+        this.isRefreshing = false;
+      }
+    }
+  }
 }
 
 export class GraphService {
@@ -151,29 +202,59 @@ export class GraphService {
             if (account.expiresAt) {
               this.tokenExpiresAt = new Date(account.expiresAt);
             }
-            this.client = Client.initWithMiddleware({
-              authProvider: {
-                getAccessToken: async () => {
-                  // If token is about to expire mid-session, attempt silent refresh
-                  if (
+
+            const authProvider: AuthenticationProvider = {
+              getAccessToken: async (authenticationProviderOptions?: any) => {
+                const claims = authenticationProviderOptions?.claims as string | undefined;
+                const forceRefresh = Boolean(authenticationProviderOptions?.forceRefresh);
+                const isExpiring =
+                  !activeToken ||
+                  Boolean(claims) ||
+                  forceRefresh ||
+                  Boolean(
                     this.tokenExpiresAt &&
-                    this.tokenExpiresAt.getTime() - Date.now() < 5 * 60 * 1000 &&
-                    account.authMethod === "browser" &&
-                    account.profileDir
-                  ) {
-                    const refreshed = await refreshAccountTokenSilent(account.id);
-                    if (refreshed) {
-                      const payload = parseJwt(refreshed);
-                      if (payload?.exp) {
-                        this.tokenExpiresAt = new Date(payload.exp * 1000);
-                      }
-                      return refreshed;
+                      this.tokenExpiresAt.getTime() - Date.now() < 5 * 60 * 1000
+                  );
+
+                if (isExpiring && account.authMethod === "browser" && account.profileDir) {
+                  const refreshed = await refreshAccountTokenSilent(account.id, 45_000, claims);
+                  if (refreshed) {
+                    activeToken = refreshed;
+                    account.token = refreshed;
+                    const payload = parseJwt(refreshed);
+                    if (payload?.exp) {
+                      this.tokenExpiresAt = new Date(payload.exp * 1000);
                     }
+                    return refreshed;
                   }
-                  return account.token || activeToken || "";
-                },
+                }
+                return account.token || activeToken || "";
               },
-            });
+            };
+
+            if (
+              typeof MiddlewareFactory !== "undefined" &&
+              typeof MiddlewareFactory.getDefaultMiddlewareChain === "function"
+            ) {
+              const rawChain = MiddlewareFactory.getDefaultMiddlewareChain(authProvider);
+              const defaultChain = Array.isArray(rawChain) ? rawChain : [];
+              const autoRefreshMiddleware = new AutoRefreshMiddleware(account.id, (newToken) => {
+                activeToken = newToken;
+                account.token = newToken;
+                const payload = parseJwt(newToken);
+                if (payload?.exp) {
+                  this.tokenExpiresAt = new Date(payload.exp * 1000);
+                }
+              });
+
+              this.client = Client.initWithMiddleware({
+                middleware: [autoRefreshMiddleware, ...defaultChain],
+              });
+            } else {
+              this.client = Client.initWithMiddleware({
+                authProvider,
+              });
+            }
             this.isInitialized = true;
             return;
           }
@@ -303,6 +384,31 @@ export class GraphService {
 
       return status;
     } catch (error) {
+      if (currentAccount?.authMethod === "browser" && currentAccount?.profileDir) {
+        try {
+          const refreshed = await refreshAccountTokenSilent(currentAccount.id);
+          if (refreshed) {
+            await this.initializeClient();
+            if (this.client) {
+              const me = await this.client.api("/me").get();
+              return {
+                isAuthenticated: true,
+                userPrincipalName: me?.userPrincipalName ?? currentAccount?.account ?? undefined,
+                displayName: me?.displayName ?? currentAccount?.displayName ?? undefined,
+                expiresAt: this.tokenExpiresAt?.toISOString() ?? currentAccount?.expiresAt,
+                accountId: currentAccount.id,
+                targetApp: currentAccount.targetApp,
+                authMethod: currentAccount.authMethod,
+                autoRefresh: true,
+                availableAccounts: availableAccounts.length > 0 ? availableAccounts : undefined,
+              };
+            }
+          }
+        } catch {
+          // Fall through
+        }
+      }
+
       console.error("Error getting user info:", error);
       return {
         isAuthenticated: false,
@@ -313,6 +419,17 @@ export class GraphService {
 
   async getClient(): Promise<Client> {
     await this.initializeClient();
+
+    if (!this.client || !this.isInitialized) {
+      const targetQuery = this._requestedAccountId || process.env.TEAMS_MCP_ACCOUNT;
+      const account = await getAccount(targetQuery).catch(() => undefined);
+      if (account?.authMethod === "browser" && account?.profileDir) {
+        const refreshed = await refreshAccountTokenSilent(account.id);
+        if (refreshed) {
+          await this.initializeClient();
+        }
+      }
+    }
 
     if (!this.client) {
       throw new Error(

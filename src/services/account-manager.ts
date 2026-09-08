@@ -10,6 +10,8 @@ export interface AccountData {
   authMethod: "browser" | "device_code" | "token";
   profileDir?: string | undefined;
   token?: string | undefined;
+  refreshToken?: string | undefined;
+  tenantId?: string | undefined;
   expiresAt?: string | undefined;
   lastRefreshed?: string | undefined;
   grantedScopes?: string[] | undefined;

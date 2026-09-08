@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -285,7 +286,9 @@ export async function authenticateViaBrowser(
     if (profileDir !== finalProfileDir) {
       try {
         await fs.cp(profileDir, finalProfileDir, { recursive: true, force: true });
-        await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+        await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {
+          // ignore cleanup errors
+        });
       } catch {
         // Best-effort profile sync
       }
@@ -304,6 +307,7 @@ export async function authenticateViaBrowser(
       grantedScopes,
       authenticated: true,
       clientId: (payload?.appid as string) || (payload?.aud as string) || "browser-session",
+      tenantId: (payload?.tid as string) || undefined,
     };
 
     // Save to multi-account store
@@ -333,23 +337,84 @@ export async function authenticateViaBrowser(
   }
 }
 
+function base64UrlEncode(buffer: Buffer): string {
+  return buffer.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+function generatePkceCodes(): { verifier: string; challenge: string } {
+  const verifier = base64UrlEncode(randomBytes(32));
+  const challenge = base64UrlEncode(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
 /**
- * Silently refresh the access token in headless mode using the account's persistent profile.
+ * Silently refresh the access token using either cached refresh_token or persistent browser profile.
  * No UI or login prompt is displayed.
  */
 export async function refreshAccountTokenSilent(
   accountIdOrAlias?: string | undefined,
-  timeoutMs = 45_000
+  timeoutMs = 45_000,
+  claims?: string | undefined
 ): Promise<string | undefined> {
   const account = await getAccount(accountIdOrAlias);
-  if (!account?.profileDir) {
+  if (!account) {
     return undefined;
   }
 
-  const targetUrl =
-    account.targetApp === "teams"
-      ? "https://teams.microsoft.com/v2/"
-      : "https://outlook.office.com/mail/";
+  const clientId = account.clientId || "9199bf20-a13f-4107-85dc-02114787ef48";
+  const tenantId = account.tenantId || "common";
+  const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+  const scope = "https://graph.microsoft.com/.default openid profile offline_access";
+
+  // Priority 1: Direct OAuth2 refresh_token grant (instant, no browser required)
+  if (account.refreshToken && !claims) {
+    try {
+      const res = await fetch(tokenUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: "https://outlook.office.com",
+        },
+        body: new URLSearchParams({
+          client_id: clientId,
+          grant_type: "refresh_token",
+          refresh_token: account.refreshToken,
+          scope,
+        }).toString(),
+      });
+
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        if (data.access_token) {
+          const payload = parseJwt(data.access_token);
+          account.token = data.access_token;
+          if (data.refresh_token) {
+            account.refreshToken = data.refresh_token;
+          }
+          if (payload?.tid) {
+            account.tenantId = payload.tid;
+          }
+          account.expiresAt = payload?.exp
+            ? new Date(payload.exp * 1000).toISOString()
+            : data.expires_in
+              ? new Date(Date.now() + data.expires_in * 1000).toISOString()
+              : undefined;
+          account.lastRefreshed = new Date().toISOString();
+          account.authenticated = true;
+
+          await saveAccount(account, false);
+          return data.access_token;
+        }
+      }
+    } catch {
+      // Fall through to browser PKCE flow
+    }
+  }
+
+  // Priority 2: Headless browser PKCE silent authorization with persistent profile cookies
+  if (!account.profileDir) {
+    return undefined;
+  }
 
   let context: BrowserContext | undefined;
 
@@ -358,65 +423,150 @@ export async function refreshAccountTokenSilent(
     const pages = context.pages();
     const page = pages.length > 0 ? pages[0] : await context.newPage();
 
+    const { verifier, challenge } = generatePkceCodes();
+    const authParams = new URLSearchParams({
+      client_id: clientId,
+      response_type: "code",
+      redirect_uri: "https://outlook.office.com/mail/",
+      scope,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      prompt: "none",
+    });
+    if (claims) {
+      authParams.set("claims", claims);
+    }
+
+    const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?${authParams.toString()}`;
+
+    let capturedCode: string | undefined;
     let capturedToken: string | undefined;
     let isResolved = false;
 
-    const tokenPromise = new Promise<string>((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        if (!isResolved) {
-          isResolved = true;
-          reject(new Error(`Silent token refresh timed out after ${timeoutMs}ms`));
+    const onNavOrUrl = (urlStr: string) => {
+      if (isResolved) return;
+      try {
+        if (urlStr.includes("code=")) {
+          const u = new URL(urlStr);
+          const c = u.searchParams.get("code");
+          if (c) {
+            capturedCode = c;
+            isResolved = true;
+          }
         }
-      }, timeoutMs);
+      } catch {
+        // ignore url parsing error
+      }
+    };
 
-      const onRequest = (request: any) => {
-        if (isResolved) return;
-        try {
-          const url = request.url();
-          if (url.includes("graph.microsoft.com")) {
-            const headers = request.headers();
-            const authHeader = headers.authorization || headers.Authorization;
-            if (authHeader && typeof authHeader === "string") {
-              const match = authHeader.match(/^Bearer\s+(.+)$/i);
-              const token = match ? match[1].trim() : authHeader.trim();
-              if (token && isLikelyGraphToken(token) && !capturedToken) {
+    if (typeof (page as any).on === "function") {
+      page.on("framenavigated", (frame: any) => {
+        const isMain = typeof page.mainFrame === "function" ? frame === page.mainFrame() : true;
+        if (isMain) {
+          const u = typeof frame?.url === "function" ? frame.url() : String(frame?.url || "");
+          onNavOrUrl(u);
+        }
+      });
+    }
+
+    const minIatSec = Math.floor(Date.now() / 1000) - 60; // only accept fresh tokens
+    const onRequest = (request: any) => {
+      if (isResolved) return;
+      try {
+        const url = typeof request.url === "function" ? request.url() : String(request.url || "");
+        if (url.includes("graph.microsoft.com")) {
+          const headers =
+            typeof request.headers === "function" ? request.headers() : request.headers || {};
+          const authHeader = headers.authorization || headers.Authorization;
+          if (authHeader && typeof authHeader === "string") {
+            const match = authHeader.match(/^Bearer\s+(.+)$/i);
+            const token = match ? match[1].trim() : authHeader.trim();
+            if (token && isLikelyGraphToken(token)) {
+              const p = parseJwt(token);
+              const isFresh =
+                p?.iat === undefined || (typeof p.iat === "number" && p.iat >= minIatSec);
+              if (isFresh && !capturedToken) {
                 capturedToken = token;
                 isResolved = true;
-                clearTimeout(timeoutId);
-                resolve(token);
               }
             }
           }
-        } catch {
-          // ignore
         }
-      };
+      } catch {
+        // ignore
+      }
+    };
+    if (typeof (context as any).on === "function") {
+      context.on("request", onRequest);
+    }
 
-      context?.on("request", onRequest);
-
-      context?.on("close", () => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timeoutId);
-          reject(new Error("Browser context was closed."));
-        }
+    if (typeof page.goto === "function") {
+      await page.goto(authUrl, { waitUntil: "networkidle", timeout: timeoutMs }).catch(() => {
+        // ignore navigation timeout or aborted navigation
       });
-    });
+    }
+    if (typeof page.url === "function") {
+      onNavOrUrl(page.url());
+    }
 
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs }).catch(() => {
-      // Ignore navigation redirect errors during login
-    });
+    // If code was captured, exchange it for tokens
+    if (capturedCode) {
+      const res = await fetch(tokenUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: "https://outlook.office.com",
+        },
+        body: new URLSearchParams({
+          client_id: clientId,
+          grant_type: "authorization_code",
+          code: capturedCode,
+          redirect_uri: "https://outlook.office.com/mail/",
+          code_verifier: verifier,
+          scope,
+        }).toString(),
+      });
 
-    const token = await tokenPromise;
-    const payload = parseJwt(token);
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        if (data.access_token) {
+          const payload = parseJwt(data.access_token);
+          account.token = data.access_token;
+          if (data.refresh_token) {
+            account.refreshToken = data.refresh_token;
+          }
+          if (payload?.tid) {
+            account.tenantId = payload.tid;
+          }
+          account.expiresAt = payload?.exp
+            ? new Date(payload.exp * 1000).toISOString()
+            : data.expires_in
+              ? new Date(Date.now() + data.expires_in * 1000).toISOString()
+              : undefined;
+          account.lastRefreshed = new Date().toISOString();
+          account.authenticated = true;
 
-    account.token = token;
-    account.expiresAt = payload?.exp ? new Date(payload.exp * 1000).toISOString() : undefined;
-    account.lastRefreshed = new Date().toISOString();
-    account.authenticated = true;
+          await saveAccount(account, false);
+          return data.access_token;
+        }
+      }
+    }
 
-    await saveAccount(account, false);
-    return token;
+    if (capturedToken) {
+      const payload = parseJwt(capturedToken);
+      account.token = capturedToken;
+      if (payload?.tid) {
+        account.tenantId = payload.tid;
+      }
+      account.expiresAt = payload?.exp ? new Date(payload.exp * 1000).toISOString() : undefined;
+      account.lastRefreshed = new Date().toISOString();
+      account.authenticated = true;
+
+      await saveAccount(account, false);
+      return capturedToken;
+    }
+
+    return undefined;
   } catch (err) {
     console.error(
       `Silent token refresh for '${account.account}' failed:`,

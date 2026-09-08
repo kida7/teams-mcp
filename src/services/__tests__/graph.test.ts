@@ -20,6 +20,9 @@ vi.mock("@microsoft/microsoft-graph-client", () => ({
   Client: {
     initWithMiddleware: vi.fn(),
   },
+  MiddlewareFactory: {
+    getDefaultMiddlewareChain: vi.fn().mockReturnValue([]),
+  },
 }));
 
 // Import after mocks are set up
